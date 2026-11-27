@@ -53,6 +53,8 @@ export enum ConnectionState {
 }
 
 export interface StreamOptions {
+  /** Override endpoint-based detection of the WebSocket message format. */
+  protocol?: 'hyperliquid' | 'quicknode';
   onError?: (error: Error) => void;
   onClose?: () => void;
   onOpen?: () => void;
@@ -123,7 +125,7 @@ export class Stream {
   private _channelCallbacks: Map<string, Callback[]> = new Map();
 
   constructor(endpoint: string, options: StreamOptions = {}) {
-    const result = this._buildWsUrl(endpoint);
+    const result = this._buildWsUrl(endpoint, options.protocol);
     this._wsUrl = result.url;
     this._isQuickNode = result.isQuickNode;
     this._onError = options.onError;
@@ -149,16 +151,24 @@ export class Stream {
     }
   }
 
-  private _buildWsUrl(url: string): { url: string; isQuickNode: boolean } {
+  private _buildWsUrl(url: string, protocol?: StreamOptions['protocol']): { url: string; isQuickNode: boolean } {
     const parsed = new URL(url);
+
+    if (protocol === 'hyperliquid') {
+      if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+      if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+      const path = parsed.pathname.replace(/\/$/, '');
+      parsed.pathname = path.endsWith('/ws') ? path : path + '/ws';
+      return { url: parsed.toString(), isQuickNode: false };
+    }
 
     // If already a ws/wss URL, use it directly
     if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') {
       const path = parsed.pathname.replace(/\/$/, '');
       if (path.endsWith('/ws')) {
-        return { url, isQuickNode: !url.includes('hyperliquid.xyz') };
+        return { url, isQuickNode: protocol === 'quicknode' || !url.includes('hyperliquid.xyz') };
       }
-      return { url: `${url.replace(/\/$/, '')}/ws`, isQuickNode: !url.includes('hyperliquid.xyz') };
+      return { url: `${url.replace(/\/$/, '')}/ws`, isQuickNode: protocol === 'quicknode' || !url.includes('hyperliquid.xyz') };
     }
 
     // Convert https to wss
@@ -166,7 +176,7 @@ export class Stream {
     const base = `${scheme}//${parsed.host}`;
 
     // Check if this is the public Hyperliquid API
-    if (parsed.host.includes('hyperliquid.xyz') || parsed.host.includes('api.hyperliquid')) {
+    if (!protocol && (parsed.host.includes('hyperliquid.xyz') || parsed.host.includes('api.hyperliquid'))) {
       return { url: `${base}/ws`, isQuickNode: false };
     }
 
@@ -430,26 +440,7 @@ export class Stream {
         };
         this._ws.send(JSON.stringify(msg));
       } else {
-        // Standard Hyperliquid API format
-        const subscription: Record<string, unknown> = { type: streamType };
-
-        if (params.coin) {
-          for (const coin of params.coin) {
-            const sub = { ...subscription, coin };
-            this._ws.send(JSON.stringify({ method: 'subscribe', subscription: sub }));
-          }
-          return;
-        }
-
-        if (params.user) {
-          for (const user of params.user) {
-            const sub = { ...subscription, user };
-            this._ws.send(JSON.stringify({ method: 'subscribe', subscription: sub }));
-          }
-          return;
-        }
-
-        this._ws.send(JSON.stringify({ method: 'subscribe', subscription }));
+        this._sendPublicSubscription('subscribe', params);
       }
     } catch {
       // Ignore send errors
@@ -471,18 +462,23 @@ export class Stream {
         };
         this._ws.send(JSON.stringify(msg));
       } else {
-        const subscription: Record<string, unknown> = { type: streamType };
-        if (params.coin) {
-          for (const coin of params.coin) {
-            const sub = { ...subscription, coin };
-            this._ws.send(JSON.stringify({ method: 'unsubscribe', subscription: sub }));
-          }
-          return;
-        }
-        this._ws.send(JSON.stringify({ method: 'unsubscribe', subscription }));
+        this._sendPublicSubscription('unsubscribe', params);
       }
     } catch {
       // Ignore send errors
+    }
+  }
+
+  private _sendPublicSubscription(method: 'subscribe' | 'unsubscribe', params: Subscription): void {
+    const subscription = { type: params.streamType };
+    const send = (fields: Record<string, string>) =>
+      this._ws!.send(JSON.stringify({ method, subscription: { ...subscription, ...fields } }));
+    if (params.coin) {
+      for (const coin of params.coin) send({ coin });
+    } else if (params.user) {
+      for (const user of params.user) send({ user });
+    } else {
+      send({});
     }
   }
 

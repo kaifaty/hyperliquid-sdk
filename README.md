@@ -229,6 +229,20 @@ await sdk.evm.traceBlock(12345);
 
 ### WebSocket Streaming
 
+For a gateway serving the public Hyperliquid WebSocket protocol on a custom host,
+pass `{ wsProtocol: 'hyperliquid' }` to the SDK constructor, or use a standalone
+stream if the rest of the SDK uses another endpoint:
+
+```typescript
+const stream = new Stream(gatewayUrl, { protocol: 'hyperliquid' });
+stream.userFills(user, onFills);
+stream.userNonFundingLedger(user, onLedger);
+stream.start();
+```
+
+Omitting the option keeps endpoint-based detection. Use `'quicknode'` to select
+QuickNode JSON-RPC explicitly.
+
 20+ subscription types for real-time data with automatic reconnection.
 
 ```typescript

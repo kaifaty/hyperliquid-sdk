@@ -43,6 +43,7 @@ import {
 
 // Import stream types conditionally (they depend on 'ws')
 type StreamType = import('./websocket').Stream;
+type StreamProtocol = import('./websocket').StreamOptions['protocol'];
 type GRPCStreamType = import('./grpc-stream').GRPCStream;
 type EVMStreamType = import('./evm-stream').EVMStream;
 
@@ -220,6 +221,8 @@ function isValidSignature(sig: unknown): sig is Signature {
 }
 
 export interface HyperliquidSDKOptions {
+  /** Set the wire protocol used by sdk.stream for a custom endpoint. */
+  wsProtocol?: StreamProtocol;
   /** Hex private key (with or without 0x). Falls back to PRIVATE_KEY env var. */
   privateKey?: string;
   /**
@@ -301,6 +304,7 @@ export class HyperliquidSDK {
   ]);
 
   private readonly _endpoint: string;
+  private readonly _wsProtocol: StreamProtocol;
   private readonly _builder: string;
   private readonly _timeout: number;
   private readonly _slippage: number;
@@ -335,6 +339,7 @@ export class HyperliquidSDK {
   constructor(endpoint: string, builder: string, options: HyperliquidSDKOptions = {}) {
     this._builder = builder;
     this._endpoint = endpoint;
+    this._wsProtocol = options.wsProtocol;
     this._timeout = options.timeout ?? HyperliquidSDK.DEFAULT_TIMEOUT;
     this._slippage = options.slippage ?? HyperliquidSDK.DEFAULT_SLIPPAGE;
     this._maxFee = options.maxFee ?? '1%';
@@ -498,7 +503,7 @@ export class HyperliquidSDK {
       // Dynamic import to avoid requiring 'ws' if not used
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { Stream } = require('./websocket');
-      this._stream = new Stream(this._endpoint);
+      this._stream = new Stream(this._endpoint, { protocol: this._wsProtocol });
     }
     return this._stream!;
   }
