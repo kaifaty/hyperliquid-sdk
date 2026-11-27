@@ -238,8 +238,10 @@ const stream = new Stream(gatewayUrl, { protocol: 'hyperliquid' });
 const after = (await loadCheckpoint()) ?? '0';
 stream.trackedWalletEvents(async ({ cursor, user, type, event }) => {
   await db.transaction(async tx => {
-    await applyWalletEvent(tx, user, type, event);
-    await saveCheckpoint(tx, cursor);
+    // Advance only if the stored cursor is lower (numeric comparison).
+    if (await advanceCheckpoint(tx, cursor)) {
+      await applyWalletEvent(tx, user, type, event);
+    }
   });
 }, after);
 stream.start();
