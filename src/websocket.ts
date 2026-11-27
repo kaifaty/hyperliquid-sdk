@@ -67,6 +67,27 @@ export interface StreamOptions {
 
 type Callback = (data: Record<string, unknown>) => void;
 
+/** A committed wallet activity from the gateway's internal all-wallet subscription. */
+export interface TrackedWalletEvent {
+  cursor: string;
+  user: string;
+  type: 'fill' | 'ledger';
+  event: Record<string, unknown>;
+}
+
+interface TrackedSubscription {
+  id: string;
+  after: string;
+  handle: (event: TrackedWalletEvent) => void | Promise<void>;
+  processing: Promise<void>;
+  socket?: WebSocket;
+}
+
+function validCursor(value: unknown): value is string {
+  return typeof value === 'string' && /^(0|[1-9]\d{0,18})$/.test(value)
+    && BigInt(value) <= 9223372036854775807n;
+}
+
 interface Subscription {
   streamType: string;
   coin?: string[];
@@ -120,6 +141,7 @@ export class Stream {
   private _pingTimer: NodeJS.Timeout | null = null;
   private _reconnectTimer: NodeJS.Timeout | null = null;
 
+  private _tracked?: TrackedSubscription;
   private _subscriptions: Map<string, Subscription> = new Map();
   private _callbacks: Map<string, Callback> = new Map();
   private _channelCallbacks: Map<string, Callback[]> = new Map();
@@ -215,6 +237,7 @@ export class Stream {
     callback: Callback,
     options: { coins?: string[]; users?: string[] } = {}
   ): string {
+    if (this._tracked) throw new Error('trackedWalletEvents requires a dedicated stream');
     const subId = this._getSubId();
     const params: Subscription = { streamType };
     if (options.coins) params.coin = options.coins;
@@ -278,6 +301,7 @@ export class Stream {
 
   /** Subscribe to candlestick data. */
   candle(coin: string, interval: string, callback: Callback): string {
+    if (this._tracked) throw new Error('trackedWalletEvents requires a dedicated stream');
     const subId = this._getSubId();
     const params: Subscription = { streamType: StreamType.CANDLE, coin: [coin], interval };
 
@@ -317,6 +341,42 @@ export class Stream {
     return this.subscribe(StreamType.USER_EVENTS, callback, { users: [user] });
   }
 
+  /** Consume all tracked wallets on a dedicated gateway connection. Resume strictly after the supplied cursor. */
+  trackedWalletEvents(handle: TrackedSubscription['handle'], after = '0'): string {
+    if (this._isQuickNode) throw new Error('trackedWalletEvents requires the Hyperliquid gateway protocol');
+    if (this._tracked || this._subscriptions.size) throw new Error('trackedWalletEvents requires a dedicated stream');
+    if (!validCursor(after)) throw new Error('Invalid tracked wallet cursor');
+    const tracked: TrackedSubscription = { id: this._getSubId(), after, handle, processing: Promise.resolve() };
+    this._tracked = tracked;
+    if (this._ws?.readyState === WebSocket.OPEN) this._subscribeTracked(tracked, this._ws);
+    return tracked.id;
+  }
+
+  private _subscribeTracked(tracked: TrackedSubscription, socket: WebSocket): void {
+    // A callback started before a disconnect can still be committing its cursor.
+    void tracked.processing.then(() => {
+      if (this._tracked !== tracked || this._ws !== socket || socket.readyState !== WebSocket.OPEN) return;
+      tracked.socket = socket;
+      socket.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'trackedWalletEvents', after: tracked.after } }));
+    });
+  }
+
+  private async _processTracked(tracked: TrackedSubscription, socket: WebSocket, page: unknown): Promise<void> {
+    if (!Array.isArray(page) || !page.length) throw new Error('Empty tracked wallet page');
+    for (const row of page) {
+      if (this._tracked !== tracked || this._ws !== socket || socket.readyState !== WebSocket.OPEN) return;
+      if (!validCursor(row?.cursor) || BigInt(row.cursor) <= BigInt(tracked.after)
+        || typeof row.user !== 'string' || !['fill', 'ledger'].includes(row.type)
+        || !row.event || typeof row.event !== 'object') throw new Error('Invalid tracked wallet event');
+      const cursor = row.cursor;
+      await tracked.handle(row);
+      tracked.after = cursor;
+    }
+    if (this._tracked === tracked && this._ws === socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ method: 'ack', cursor: tracked.after }));
+    }
+  }
+
   /** Subscribe to user's trade fills. */
   userFills(user: string, callback: Callback): string {
     return this.subscribe(StreamType.USER_FILLS, callback, { users: [user] });
@@ -344,6 +404,7 @@ export class Stream {
 
   /** Subscribe to user's active asset trading parameters. */
   activeAssetData(user: string, coin: string, callback: Callback): string {
+    if (this._tracked) throw new Error('trackedWalletEvents requires a dedicated stream');
     const subId = this._getSubId();
     const params: Subscription = { streamType: StreamType.ACTIVE_ASSET_DATA, user: [user], coin: [coin] };
 
@@ -390,6 +451,12 @@ export class Stream {
 
   /** Unsubscribe from a stream. */
   unsubscribe(subId: string): void {
+    if (this._tracked?.id === subId) {
+      // This mode owns the connection. Closing also discards any old page in transit.
+      this._tracked = undefined;
+      this.stop();
+      return;
+    }
     const params = this._subscriptions.get(subId);
     const callback = this._callbacks.get(subId);
 
@@ -486,8 +553,21 @@ export class Stream {
     try {
       const message = JSON.parse(data.toString());
 
-      // Handle pong response
       const channel = message.channel ?? '';
+      const tracked = this._tracked;
+      if (channel === 'trackedWalletEvents' && tracked?.socket && tracked.socket === this._ws) {
+        const socket = tracked.socket;
+        tracked.processing = tracked.processing.then(() => this._processTracked(tracked, socket, message.data)).catch(err => {
+          this._onWsError(err instanceof Error ? err : new Error(String(err)));
+          socket.close();
+        });
+        return;
+      }
+      if (channel === 'error' && tracked) {
+        this._onWsError(new Error(String(message.data)));
+        this.stop();
+        return;
+      }
       if (channel === 'pong' || message.type === 'pong') {
         this._lastPong = Date.now();
         return;
@@ -553,6 +633,8 @@ export class Stream {
     this._reconnectAttempt = 0;
     this._reconnectDelay = Stream.INITIAL_RECONNECT_DELAY;
     this._lastPong = Date.now();
+
+    if (this._tracked && this._ws) this._subscribeTracked(this._tracked, this._ws);
 
     // Resubscribe to all streams
     for (const params of this._subscriptions.values()) {
@@ -640,12 +722,13 @@ export class Stream {
 
   private _connect(): void {
     this._setState(ConnectionState.CONNECTING);
-    this._ws = new WebSocket(this._wsUrl);
+    const socket = new WebSocket(this._wsUrl);
+    this._ws = socket;
 
-    this._ws.on('message', (data) => this._onMessage(data));
-    this._ws.on('error', (error) => this._onWsError(error));
-    this._ws.on('close', () => this._onWsClose());
-    this._ws.on('open', () => this._onWsOpen());
+    socket.on('message', data => { if (this._ws === socket) this._onMessage(data); });
+    socket.on('error', error => { if (this._ws === socket) this._onWsError(error); });
+    socket.on('close', () => { if (this._ws === socket) this._onWsClose(); });
+    socket.on('open', () => { if (this._ws === socket) this._onWsOpen(); });
   }
 
   /** Start the stream. */

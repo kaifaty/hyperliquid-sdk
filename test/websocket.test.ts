@@ -79,3 +79,62 @@ describe('WebSocket protocol selection', () => {
     }
   });
 });
+
+it('resumes the all-wallet feed after the last completed callback, including mid-page disconnects', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await once(server, 'listening');
+  const { port } = server.address() as AddressInfo;
+  const errors = vi.fn();
+  const stream = new Stream(`ws://127.0.0.1:${port}/ws`, { protocol: 'hyperliquid', onError: errors });
+  const other = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const first = { cursor: '9007199254740993', type: 'fill', user, event: { hash: 'builder-fill' } };
+  const second = { cursor: '9007199254740994', type: 'ledger', user: other, event: { hash: 'transfer' } };
+  const offline = { cursor: '9007199254740996', type: 'fill', user: other, event: { hash: 'offline-fill' } };
+  const resumes: string[] = [];
+  const handled: string[] = [];
+  const acks: string[] = [];
+  let complete!: () => void;
+  const commit = new Promise<void>(resolve => { complete = resolve; });
+  let began!: () => void;
+  const processing = new Promise<void>(resolve => { began = resolve; });
+  let count = 0;
+  const reconnected = new Promise<void>(resolve => {
+    server.on('connection', socket => {
+      if (++count === 2) resolve();
+      socket.on('message', data => {
+        const req = JSON.parse(data.toString());
+        if (req.method === 'ack') { acks.push(req.cursor); return; }
+        if (req.method !== 'subscribe' || req.subscription.type !== 'trackedWalletEvents' || 'user' in req.subscription) return;
+        resumes.push(req.subscription.after);
+        socket.send(JSON.stringify({ channel: 'trackedWalletEvents', data:
+          [first, second, ...(resumes.length === 1 ? [] : [offline])].filter(e => BigInt(e.cursor) > BigInt(req.subscription.after)) }));
+      });
+    });
+  });
+  let failOnce = true;
+  stream.trackedWalletEvents(async activity => {
+    if (activity.cursor === offline.cursor && failOnce) {
+      failOnce = false;
+      throw new Error('commit failed');
+    }
+    if (activity.cursor === first.cursor) { began(); await commit; }
+    handled.push(activity.event.hash as string);
+  });
+  try {
+    stream.start();
+    await processing;
+    for (const socket of server.clients) socket.terminate();
+    await reconnected;
+    expect(resumes).toEqual(['0']);
+    complete();
+    await vi.waitFor(() => expect(acks).toEqual([offline.cursor]), { timeout: 3000 });
+    expect(errors).toHaveBeenCalledOnce();
+    expect(resumes).toEqual(['0', first.cursor, second.cursor]);
+    expect(handled).toEqual(['builder-fill', 'transfer', 'offline-fill']);
+  } finally {
+    complete();
+    stream.stop();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

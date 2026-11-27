@@ -34,7 +34,7 @@ export { HyperCore } from './hypercore';
 export { EVM } from './evm';
 
 // WebSocket streaming
-export { Stream, StreamType, ConnectionState as StreamConnectionState, StreamOptions } from './websocket';
+export { Stream, StreamType, ConnectionState as StreamConnectionState, StreamOptions, TrackedWalletEvent } from './websocket';
 
 // gRPC streaming
 export { GRPCStream, GRPCStreamType, GRPCStreamOptions, ConnectionState as GRPCConnectionState } from './grpc-stream';

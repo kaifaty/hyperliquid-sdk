@@ -235,10 +235,24 @@ stream if the rest of the SDK uses another endpoint:
 
 ```typescript
 const stream = new Stream(gatewayUrl, { protocol: 'hyperliquid' });
-stream.userFills(user, onFills);
-stream.userNonFundingLedger(user, onLedger);
+const after = (await loadCheckpoint()) ?? '0';
+stream.trackedWalletEvents(async ({ cursor, user, type, event }) => {
+  await db.transaction(async tx => {
+    await applyWalletEvent(tx, user, type, event);
+    await saveCheckpoint(tx, cursor);
+  });
+}, after);
 stream.start();
 ```
+
+`trackedWalletEvents` is a gateway extension for backend consumers. Use one
+dedicated stream for all tracked wallets. It receives fills and non-funding
+ledger entries, including newly tracked wallets. The default cursor `"0"`
+replays all available history. Cursors are decimal strings. The SDK awaits
+each callback before advancing, and subscribes from the last successful
+cursor on reconnect. A rejected callback triggers a retry. Persist its effect
+and cursor atomically and supply the saved cursor when restarting the process. Unsubscribing closes
+the dedicated stream.
 
 Omitting the option keeps endpoint-based detection. Use `'quicknode'` to select
 QuickNode JSON-RPC explicitly.
