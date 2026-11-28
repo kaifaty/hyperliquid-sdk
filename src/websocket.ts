@@ -12,6 +12,7 @@
  */
 
 import WebSocket from 'ws';
+import type { OrderStatus } from './types';
 
 /** Available stream types. */
 export enum StreamType {
@@ -68,17 +69,19 @@ export interface StreamOptions {
 type Callback = (data: Record<string, unknown>) => void;
 
 /** A committed wallet activity from the gateway's internal all-wallet subscription. */
-export interface TrackedWalletEvent {
+export type TrackedWalletEvent<IncludeOrders extends boolean = boolean> = {
   cursor: string;
   user: string;
-  type: 'fill' | 'ledger';
-  event: Record<string, unknown>;
-}
+} & (
+  | { type: 'fill' | 'ledger'; event: Record<string, unknown> }
+  | (IncludeOrders extends true ? { type: 'orderStatus'; event: Required<OrderStatus> } : never)
+);
 
 interface TrackedSubscription {
   id: string;
   after: string;
-  handle: (event: TrackedWalletEvent) => void | Promise<void>;
+  includeOrderStatuses: boolean;
+  handle(event: TrackedWalletEvent): void | Promise<void>;
   processing: Promise<void>;
   socket?: WebSocket;
 }
@@ -342,11 +345,19 @@ export class Stream {
   }
 
   /** Consume all tracked wallets on a dedicated gateway connection. Resume strictly after the supplied cursor. */
-  trackedWalletEvents(handle: TrackedSubscription['handle'], after = '0'): string {
+  trackedWalletEvents<IncludeOrders extends boolean = false>(
+    handle: (event: TrackedWalletEvent<IncludeOrders>) => void | Promise<void>,
+    after = '0',
+    { includeOrderStatuses }: { includeOrderStatuses?: IncludeOrders } = {},
+  ): string {
     if (this._isQuickNode) throw new Error('trackedWalletEvents requires the Hyperliquid gateway protocol');
     if (this._tracked || this._subscriptions.size) throw new Error('trackedWalletEvents requires a dedicated stream');
     if (!validCursor(after)) throw new Error('Invalid tracked wallet cursor');
-    const tracked: TrackedSubscription = { id: this._getSubId(), after, handle, processing: Promise.resolve() };
+    const tracked: TrackedSubscription = {
+      id: this._getSubId(), after, handle,
+      includeOrderStatuses: includeOrderStatuses === true,
+      processing: Promise.resolve(),
+    };
     this._tracked = tracked;
     if (this._ws?.readyState === WebSocket.OPEN) this._subscribeTracked(tracked, this._ws);
     return tracked.id;
@@ -357,7 +368,12 @@ export class Stream {
     void tracked.processing.then(() => {
       if (this._tracked !== tracked || this._ws !== socket || socket.readyState !== WebSocket.OPEN) return;
       tracked.socket = socket;
-      socket.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'trackedWalletEvents', after: tracked.after } }));
+      const subscription = {
+        type: 'trackedWalletEvents',
+        after: tracked.after,
+        includeOrderStatuses: tracked.includeOrderStatuses || undefined,
+      };
+      socket.send(JSON.stringify({ method: 'subscribe', subscription }));
     });
   }
 
@@ -366,8 +382,17 @@ export class Stream {
     for (const row of page) {
       if (this._tracked !== tracked || this._ws !== socket || socket.readyState !== WebSocket.OPEN) return;
       if (!validCursor(row?.cursor) || BigInt(row.cursor) <= BigInt(tracked.after)
-        || typeof row.user !== 'string' || !['fill', 'ledger'].includes(row.type)
-        || !row.event || typeof row.event !== 'object') throw new Error('Invalid tracked wallet event');
+        || typeof row.user !== 'string' || !row.event || typeof row.event !== 'object') {
+        throw new Error('Invalid tracked wallet event');
+      }
+      if (row.type === 'orderStatus') {
+        if (!tracked.includeOrderStatuses || !row.event.order || !Number.isInteger(row.event.order.oid)
+          || typeof row.event.status !== 'string' || !Number.isSafeInteger(row.event.statusTimestamp)) {
+          throw new Error('Invalid tracked wallet order status');
+        }
+      } else if (row.type !== 'fill' && row.type !== 'ledger') {
+        throw new Error('Invalid tracked wallet event');
+      }
       const cursor = row.cursor;
       await tracked.handle(row);
       tracked.after = cursor;

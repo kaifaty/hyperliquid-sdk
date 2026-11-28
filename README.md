@@ -243,13 +243,17 @@ stream.trackedWalletEvents(async ({ cursor, user, type, event }) => {
       await applyWalletEvent(tx, user, type, event);
     }
   });
-}, after);
+}, after, { includeOrderStatuses: true });
 stream.start();
 ```
 
 `trackedWalletEvents` is a gateway extension for backend consumers. Use one
 dedicated stream for all tracked wallets. It receives fills and non-funding
-ledger entries, including newly tracked wallets. The default cursor `"0"`
+ledger entries, including newly tracked wallets. Pass `{ includeOrderStatuses: true }`
+as the third argument to also receive `orderStatus` events. Their payload contains
+the original `order`, its new `status` and `statusTimestamp` in Unix milliseconds.
+Each transition of the same order has its own cursor. The SDK keeps this option
+when reconnecting. The default cursor `"0"`
 replays all available history. Cursors are decimal strings. The SDK awaits
 each callback before advancing, and subscribes from the last successful
 cursor on reconnect. A rejected callback triggers a retry. Persist its effect
